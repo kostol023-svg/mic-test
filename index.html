@@ -37,7 +37,7 @@ small{color:var(--muted)}
 </head>
 <body>
 <main>
-  <h1>Тест: слышит ли сайт микрофон в фоне</h1>
+  <h1>Тест: слышит ли сайт микрофон в фоне <small>v2</small></h1>
   <p class="sub">Открой страницу именно в Safari, не через «На экран Домой». Можно в наушниках.</p>
 
   <div class="card">
@@ -67,7 +67,7 @@ small{color:var(--muted)}
     <div class="card">
       <h2>Уровень микрофона</h2>
       <canvas id="chart"></canvas>
-      <div class="legend">Серым отмечено время, когда страница была в фоне или экран был заблокирован.</div>
+      <div class="legend">Зелёная линия — уровень по записи, синяя — живой замер. Серым отмечено время в фоне.</div>
     </div>
     <div class="card">
       <h2>Запись</h2>
@@ -96,6 +96,43 @@ small{color:var(--muted)}
   var hiddenStart = null;
   var pings = [];     // {t, ok, h}
   var buf = null;
+  var beepEl = null, recInfo = null;
+
+  // Beep as a WAV file played through an <audio> element (not WebAudio, which iOS interrupts in background).
+  function makeBeepUrl() {
+    var sr = 22050, n = Math.floor(sr * 0.25), b = new ArrayBuffer(44 + n * 2), v = new DataView(b);
+    var w = function (o, s) { for (var i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    w(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); w(8, "WAVE"); w(12, "fmt ");
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    w(36, "data"); v.setUint32(40, n * 2, true);
+    for (var i = 0; i < n; i++) {
+      var env = Math.min(1, i / 200, (n - i) / 200);
+      v.setInt16(44 + i * 2, Math.sin(2 * Math.PI * 880 * i / sr) * 0.5 * env * 32767, true);
+    }
+    return URL.createObjectURL(new Blob([b], { type: "audio/wav" }));
+  }
+
+  // Decode the recording afterwards and measure loudness every 0.25 s: ground truth independent of WebAudio.
+  function analyseRecording(blob, cb) {
+    var AC = window.AudioContext || window.webkitAudioContext, c;
+    try { c = new AC(); } catch (e) { cb(null); return; }
+    var fr = new FileReader();
+    fr.onload = function () {
+      c.decodeAudioData(fr.result, function (ab) {
+        var d = ab.getChannelData(0), sr = ab.sampleRate, win = Math.floor(sr * 0.25), levels = [];
+        for (var i = 0; i + win <= d.length; i += win) {
+          var s = 0;
+          for (var k = i; k < i + win; k++) s += d[k] * d[k];
+          levels.push({ t: i / sr, rms: Math.sqrt(s / win) });
+        }
+        if (c.close) c.close();
+        cb({ dur: ab.duration, levels: levels });
+      }, function () { if (c.close) c.close(); cb(null); });
+    };
+    fr.onerror = function () { cb(null); };
+    fr.readAsArrayBuffer(blob);
+  }
 
   function now() { return (Date.now() - t0) / 1000; }
   function fmt(x) { return x.toFixed(1); }
@@ -136,17 +173,16 @@ small{color:var(--muted)}
   }
 
   function beep() {
-    if (!ctx || !$("beepOn").checked) return;
+    if (!beepEl || !$("beepOn").checked) return;
+    var where = document.hidden ? "в фоне" : "на экране";
     try {
-      var o = ctx.createOscillator(), g = ctx.createGain(), t = ctx.currentTime;
-      o.frequency.value = 880;
-      g.gain.setValueAtTime(0.0001, t);
-      g.gain.exponentialRampToValueAtTime(0.25, t + 0.02);
-      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
-      o.connect(g); g.connect(ctx.destination);
-      o.start(t); o.stop(t + 0.25);
-      log("писк", document.hidden ? "в фоне" : "на экране");
-    } catch (e) { log("ошибка писка", String(e)); }
+      beepEl.volume = 1;
+      beepEl.currentTime = 0;
+      var p = beepEl.play();
+      if (p && p.then) p.then(function () { log("писк", where + ": играет"); },
+                              function (e) { log("писк", where + ": НЕ играет (" + e.name + ")"); });
+      else log("писк", where);
+    } catch (e) { log("писк", where + ": ошибка " + e); }
   }
 
   function ping() {
@@ -169,6 +205,11 @@ small{color:var(--muted)}
     // Create and resume AudioContext synchronously inside the tap (iOS requirement).
     ctx = new AC();
     if (ctx.resume) ctx.resume();
+    // Unlock the <audio> element inside the tap so it may play later from timers.
+    if (!beepEl) { beepEl = new Audio(makeBeepUrl()); beepEl.preload = "auto"; }
+    beepEl.volume = 0.01;
+    try { var pp = beepEl.play(); if (pp && pp.catch) pp.catch(function () {}); } catch (e) {}
+    recInfo = null;
     $("start").disabled = true;
     setState("Запрашиваю микрофон…");
 
@@ -245,7 +286,8 @@ small{color:var(--muted)}
       rec.onstop = function () {
         var blob = new Blob(chunks, { type: recMime || (chunks[0] && chunks[0].type) || "audio/mp4" });
         $("player").src = URL.createObjectURL(blob);
-        finish();
+        setState("Анализирую запись…");
+        analyseRecording(blob, function (r) { recInfo = r; setState("Готово"); finish(); });
       };
       rec.stop();
     } else {
@@ -293,12 +335,34 @@ small{color:var(--muted)}
     else if (jsRatio > 0.1) out.items.push(["warn", "В фоне страницу притормаживали: она работала с перерывами (" + Math.round(jsRatio * 100) + "% замеров)."]);
     else out.items.push(["bad", "В фоне страница засыпала: замеров почти нет (" + Math.round(jsRatio * 100) + "%)."]);
 
-    var peakHidden = hs.reduce(function (m, s) { return Math.max(m, s.rms); }, 0);
-    var mutedEv = events.some(function (e) { return e.type === "микрофон" && /заглуш|заверш/.test(e.info); });
-    if (hs.length < 5) out.items.push(["warn", "Уровень микрофона в фоне замерить не удалось, проверь по записи ниже."]);
-    else if (peakHidden > threshold && !mutedEv) out.items.push(["ok", "Микрофон слышал тебя в фоне (пик " + peakHidden.toFixed(3) + " при тишине около " + baseline.toFixed(3) + ")."]);
-    else if (peakHidden > threshold) out.items.push(["warn", "Микрофон в фоне что-то ловил, но система его на время глушила. Проверь по записи."]);
-    else out.items.push(["bad", "В фоне микрофон молчал (пик " + peakHidden.toFixed(3) + "). Если ты точно говорил вслух, значит, фон его отключает."]);
+    // Microphone verdict from the decoded recording (WebAudio analyser is unreliable once iOS interrupts it).
+    if (!recInfo) {
+      out.items.push(["warn", "Запись разобрать не удалось. Послушай её и скажи, слышно ли, как ты считал в фоне."]);
+    } else {
+      var ratio = recInfo.dur / Math.max(duration, 1);
+      out.rec = { dur: recInfo.dur, ratio: ratio, segs: [] };
+      if (ratio < 0.85) {
+        out.items.push(["bad", "Запись в фоне вставала на паузу: записано " + fmt(recInfo.dur) + " с из " + fmt(duration) + " с. Микрофон в фоне не пишет."]);
+      } else {
+        var lv = recInfo.levels.map(function (l) { return l.rms; });
+        var recBase = median(lv), recThr = Math.max(0.01, recBase * 4), anyLoud = false;
+        hidden.forEach(function (seg, i) {
+          var p = recInfo.levels.filter(function (l) { return l.t >= seg[0] + 0.5 && l.t <= seg[1] - 0.3; })
+            .reduce(function (m, l) { return Math.max(m, l.rms); }, 0);
+          out.rec.segs.push(p);
+          if (p > recThr) anyLoud = true;
+        });
+        out.rec.base = recBase; out.rec.thr = recThr;
+        out.items.push([anyLoud ? "ok" : "bad",
+          (anyLoud ? "По записи: микрофон в фоне работал. " : "По записи: в фоне тишина, микрофон, похоже, глушится. ") +
+          "Пики в фоне: " + out.rec.segs.map(function (p) { return p.toFixed(3); }).join(", ") + " (порог " + recThr.toFixed(3) + ")."]);
+      }
+    }
+    out.items.push(["", "Живой замер в фоне (WebAudio) iOS останавливает, поэтому вердикт по микрофону сделан по записи."]);
+    var beepsHidden = events.filter(function (e) { return e.type === "писк" && /в фоне/.test(e.info); });
+    var beepsOk = beepsHidden.filter(function (e) { return /играет/.test(e.info) && !/НЕ/.test(e.info); }).length;
+    if (beepsHidden.length) out.items.push([beepsOk === beepsHidden.length ? "ok" : (beepsOk ? "warn" : "bad"),
+      "Звук через плеер в фоне: система разрешила " + beepsOk + " из " + beepsHidden.length + " писков. Скажи, слышал ли ты их на самом деле."]);
 
     var hp = pings.filter(function (p) { return p.h; });
     if (!hp.length) out.items.push(["warn", "Сеть в фоне не проверилась: страница не успела отправить ни одного запроса."]);
@@ -306,7 +370,6 @@ small{color:var(--muted)}
       var okN = hp.filter(function (p) { return p.ok; }).length;
       out.items.push([okN === hp.length ? "ok" : (okN ? "warn" : "bad"), "Интернет в фоне: прошло " + okN + " из " + hp.length + " запросов."]);
     }
-    out.items.push(["", "Писк при заблокированном экране: если ты его слышал, голос преподавателя в фоне тоже будет слышен. Напиши мне, был ли писк."]);
     return finishAnalysis(out, duration, baseline, threshold, hidDur);
   }
 
@@ -343,7 +406,8 @@ small{color:var(--muted)}
 
   function buildReport(a) {
     var lines = [];
-    lines.push("ТЕСТ МИКРОФОНА В ФОНЕ");
+    lines.push("ТЕСТ МИКРОФОНА В ФОНЕ v2");
+    if (a.rec) lines.push("Запись: " + fmt(a.rec.dur) + " с (" + Math.round(a.rec.ratio * 100) + "% реального времени)");
     lines.push("UA: " + navigator.userAgent);
     lines.push("Длительность: " + fmt(a.duration) + " с, в фоне: " + fmt(a.hidDur) + " с, запись: " + (recMime || "нет/по умолчанию"));
     lines.push("Тишина ~" + a.baseline.toFixed(3) + ", порог " + a.threshold.toFixed(3));
@@ -366,6 +430,7 @@ small{color:var(--muted)}
     g.clearRect(0, 0, w, h);
     var dur = Math.max(a.duration, 1);
     var peak = samples.reduce(function (m, s) { return Math.max(m, s.rms); }, 0);
+    if (recInfo) peak = recInfo.levels.reduce(function (m, l) { return Math.max(m, l.rms); }, peak);
     var ymax = Math.max(0.05, peak * 1.1);
     var x = function (t) { return (t / dur) * w; };
     var y = function (r) { return h - 6 - (r / ymax) * (h - 12); };
@@ -377,6 +442,14 @@ small{color:var(--muted)}
     g.beginPath(); g.moveTo(0, y(a.threshold)); g.lineTo(w, y(a.threshold)); g.stroke();
     g.setLineDash([]);
 
+    if (recInfo && recInfo.levels.length) {
+      g.strokeStyle = "#2fbf71"; g.lineWidth = 1.5; g.beginPath();
+      recInfo.levels.forEach(function (l, i) {
+        var yy = h - 6 - (Math.min(l.rms, ymax) / ymax) * (h - 12);
+        if (i === 0) g.moveTo(x(l.t), yy); else g.lineTo(x(l.t), yy);
+      });
+      g.stroke();
+    }
     g.strokeStyle = "#4f8cff"; g.lineWidth = 1.5;
     g.beginPath();
     for (var i = 0; i < samples.length; i++) {
